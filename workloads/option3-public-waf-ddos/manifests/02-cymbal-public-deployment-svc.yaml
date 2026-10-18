@@ -1,0 +1,269 @@
+# ==============================================================================
+# 02-cymbal-public-deployment-svc.yaml
+# Phase 3: Multi-Zone Cymbal Public Edge Storefront + Cloud CDN Static Endpoint
+#          + NodePort Service (:30080) for Google Cloud Zonal NEGs
+# ==============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cymbal-public-app-code
+  namespace: cymbal-public
+data:
+  app.py: |
+    import datetime
+    import html
+    import http.server
+    import json
+    import os
+    import socket
+    import urllib.parse
+
+    PORT = 8080
+    POD_NAME = os.environ.get("POD_NAME", socket.gethostname())
+    NODE_NAME = os.environ.get("NODE_NAME", "unknown-node")
+    POD_IP = os.environ.get("POD_IP", "unknown-ip")
+
+    CATALOG_DATA = {
+        "store": "Cymbal Global Edge Storefront",
+        "edge_protection": "Google Cloud Armor WAF + Cloud CDN + Global External ALB",
+        "generated_by_pod": POD_NAME,
+        "items": [
+            {"sku": "CYM-EDGE-01", "name": "Cymbal Carbon Trail Bike", "price_usd": 2499.00, "stock": "In Stock"},
+            {"sku": "CYM-EDGE-02", "name": "Cymbal Alpine Smart Watch", "price_usd": 399.00, "stock": "In Stock"},
+            {"sku": "CYM-EDGE-03", "name": "Cymbal Solar Expedition Tent", "price_usd": 649.00, "stock": "In Stock"},
+            {"sku": "CYM-EDGE-04", "name": "Cymbal Ultralight Pack 45L", "price_usd": 229.00, "stock": "Limited"}
+        ]
+    }
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            if parsed.path == "/healthz":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "ok", "pod": POD_NAME, "node": NODE_NAME}).encode("utf-8"))
+                return
+
+            if parsed.path.startswith("/static/"):
+                payload = dict(CATALOG_DATA)
+                payload["cached_at_utc"] = now_utc
+                body = json.dumps(payload, indent=2).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            qs = urllib.parse.parse_qs(parsed.query)
+            search_q = qs.get("q", [""])[0]
+
+            xff = self.headers.get("X-Forwarded-For", "Direct / Internal")
+            xfp = self.headers.get("X-Forwarded-Proto", "http")
+            via = self.headers.get("Via", "N/A")
+            trace = self.headers.get("X-Cloud-Trace-Context", "N/A")
+            ua = self.headers.get("User-Agent", "N/A")
+
+            search_banner = ""
+            if search_q:
+                search_banner = f"""
+                <div style="background:#dcfce7;border:1px solid #16a34a;color:#14532d;padding:12px 16px;border-radius:8px;margin-bottom:20px;">
+                  <strong>Cloud Armor WAF Inspection Passed (200 OK):</strong> Safe query <code>{html.escape(search_q)}</code> allowed through Google Edge to OpenShift Pod.
+                </div>
+                """
+
+            page = f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8"/>
+      <title>Cymbal Public Edge — Cloud Armor WAF, CDN & Global ALB on OpenShift Dedicated</title>
+      <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }}
+        header {{ background: linear-gradient(135deg, #1e1b4b 0%, #312e81 50%, #4f46e5 100%); color: white; padding: 24px 32px; }}
+        .badge {{ display: inline-block; background: rgba(255,255,255,0.18); padding: 4px 10px; border-radius: 999px; font-size: 12px; margin-right: 8px; font-weight: 600; }}
+        .container {{ max-width: 1120px; margin: 24px auto; padding: 0 24px; }}
+        .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; margin-bottom: 24px; }}
+        .card {{ background: white; border-radius: 12px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border: 1px solid #e2e8f0; }}
+        h2 {{ margin-top: 0; font-size: 18px; color: #1e293b; }}
+        table {{ width: 100%; border-collapse: collapse; font-size: 13.5px; }}
+        th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #f1f5f9; }}
+        th {{ color: #64748b; font-weight: 600; width: 38%; }}
+        code {{ background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 12.5px; color: #334155; }}
+        .btn {{ display: inline-block; padding: 8px 14px; border-radius: 6px; text-decoration: none; font-size: 13px; font-weight: 600; margin: 4px 6px 4px 0; }}
+        .btn-ok {{ background: #dcfce7; color: #166534; border: 1px solid #86efac; }}
+        .btn-waf {{ background: #ffe4e6; color: #9f1239; border: 1px solid #fda4af; }}
+        .btn-cdn {{ background: #e0f2fe; color: #075985; border: 1px solid #7dd3fc; }}
+      </style>
+    </head>
+    <body>
+      <header>
+        <div>
+          <span class="badge">PHASE 3: PUBLIC EDGE</span>
+          <span class="badge">CLOUD ARMOR WAF + DDOS</span>
+          <span class="badge">CLOUD CDN</span>
+          <span class="badge">GLOBAL EXTERNAL ALB (L7)</span>
+          <span class="badge">PRIVATE OSD WORKERS (ZERO PUBLIC IPS)</span>
+        </div>
+        <h1 style="margin:12px 0 4px 0;font-size:26px;">Cymbal Global Public Storefront</h1>
+        <p style="margin:0;opacity:0.9;font-size:14px;">Protected at Google Cloud Edge by Cloud Armor OWASP Top 10 WAF, Rate-Limiting DDoS, SSL Policy (TLS 1.2+ MODERN) &amp; Cloud CDN</p>
+      </header>
+      <div class="container">
+        {search_banner}
+        <div class="grid">
+          <div class="card">
+            <h2>1. OpenShift Pod &amp; Private Node Telemetry</h2>
+            <table>
+              <tr><th>Serving Pod</th><td><code>{html.escape(POD_NAME)}</code></td></tr>
+              <tr><th>Worker Node</th><td><code>{html.escape(NODE_NAME)}</code> (Private IP only)</td></tr>
+              <tr><th>Pod IP</th><td><code>{html.escape(POD_IP)}</code></td></tr>
+              <tr><th>Backend Mechanism</th><td>Zonal <code>GCE_VM_IP_PORT</code> NEG (:30080)</td></tr>
+              <tr><th>Pod Security</th><td>OpenShift <code>restricted-v2</code> SCC + Zero-Trust <code>NetworkPolicy</code></td></tr>
+              <tr><th>Rendered At</th><td>{now_utc}</td></tr>
+            </table>
+          </div>
+          <div class="card">
+            <h2>2. Google Cloud Global Load Balancer Headers</h2>
+            <table>
+              <tr><th>X-Forwarded-For</th><td><code>{html.escape(xff)}</code></td></tr>
+              <tr><th>X-Forwarded-Proto</th><td><code>{html.escape(xfp)}</code></td></tr>
+              <tr><th>Via (Google Edge Proxy)</th><td><code>{html.escape(via)}</code></td></tr>
+              <tr><th>X-Cloud-Trace-Context</th><td><code>{html.escape(trace)}</code></td></tr>
+              <tr><th>Client User-Agent</th><td><code>{html.escape(ua[:80])}</code></td></tr>
+            </table>
+          </div>
+        </div>
+
+        <div class="card" style="margin-bottom:24px;">
+          <h2>3. Interactive Google Cloud Armor WAF &amp; Cloud CDN Verification</h2>
+          <p style="font-size:13.5px;color:#475569;margin-top:0;">
+            Click any link below to test how <strong>Google Cloud Armor</strong> evaluates requests at Google's Global Edge before they reach the OpenShift VPC:
+          </p>
+          <div>
+            <a class="btn btn-ok" href="/?q=trail+bike">Legitimate Search (200 OK)</a>
+            <a class="btn btn-cdn" href="/static/catalog.json" target="_blank">Cloud CDN Static Catalog JSON (/static/catalog.json)</a>
+            <a class="btn btn-waf" href="/?q=1%27+OR+%271%27%3D%271">Test SQL Injection (Blocked: 403 Forbidden)</a>
+            <a class="btn btn-waf" href="/?q=%3Cscript%3Ealert(1)%3C%2Fscript%3E">Test XSS Attack (Blocked: 403 Forbidden)</a>
+            <a class="btn btn-waf" href="/?file=..%2F..%2Fetc%2Fpasswd">Test LFI Path Traversal (Blocked: 403 Forbidden)</a>
+            <a class="btn btn-waf" href="/?cmd=%3Bcat+%2Fetc%2Fpasswd">Test RCE Command Injection (Blocked: 403 Forbidden)</a>
+          </div>
+        </div>
+      </div>
+    </body>
+    </html>"""
+            body = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    if __name__ == "__main__":
+        server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+        print(f"Cymbal Public Edge Storefront listening on 0.0.0.0:{PORT}")
+        server.serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cymbal-public-web
+  namespace: cymbal-public
+  labels:
+    app: cymbal-public-web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cymbal-public-web
+  template:
+    metadata:
+      labels:
+        app: cymbal-public-web
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: cymbal-public-web
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: storefront
+          image: registry.access.redhat.com/ubi9/python-314:latest
+          command: ["python3", "/app/app.py"]
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          volumeMounts:
+            - name: app-code
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: app-code
+          configMap:
+            name: cymbal-public-app-code
+---
+# NodePort Service (:30080) targeted by Google Cloud Zonal GCE_VM_IP_PORT NEGs
+# and Google Front End (GFE) health checks (/healthz)
+apiVersion: v1
+kind: Service
+metadata:
+  name: cymbal-public-neg-svc
+  namespace: cymbal-public
+  labels:
+    app: cymbal-public-web
+spec:
+  type: NodePort
+  externalTrafficPolicy: Cluster
+  selector:
+    app: cymbal-public-web
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 8080
+      nodePort: 30080

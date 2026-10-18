@@ -1,0 +1,41 @@
+# ==============================================================================
+# 01-cymbal-public-namespace-netpol.yaml
+# Phase 3: Public Edge Workload Namespace & Zero-Trust Kubernetes NetworkPolicy
+# ==============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cymbal-public
+  labels:
+    app.kubernetes.io/part-of: cymbal-public-edge
+---
+# Zero-Trust NetworkPolicy:
+# 1. Allows Ingress ONLY to port 8080 on cymbal-public-web pods
+# 2. Allows Egress ONLY to cluster DNS (UDP/TCP 53), preventing lateral movement
+#    to other namespaces or internal services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cymbal-public-zero-trust-netpol
+  namespace: cymbal-public
+spec:
+  podSelector:
+    matchLabels:
+      app: cymbal-public-web
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 5353
+        - protocol: TCP
+          port: 5353

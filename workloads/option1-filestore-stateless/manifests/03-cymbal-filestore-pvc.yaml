@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cymbal-storefront
+  labels:
+    app.kubernetes.io/part-of: cymbal-shops
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: cymbal-shared-assets-pvc
+  namespace: cymbal-storefront
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: filestore-regional-csi
+  resources:
+    requests:
+      storage: 100Gi

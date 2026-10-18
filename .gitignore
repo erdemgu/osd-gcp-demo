@@ -1,0 +1,14 @@
+# Generated credentials, keys, and environment configuration
+config.env
+*.env
+generated/
+*.json
+*.key
+*.pem
+*-ssh
+*-ssh.pub
+*.htpasswd
+cluster-config.yaml
+cluster-admin-rbac.yaml
+kubeconfig
+osd-setup/

@@ -1,0 +1,8 @@
+# Enforce LF line endings across all OS environments (including Windows / WSL)
+* text=auto eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.tpl text eol=lf
+*.md text eol=lf
+*.env text eol=lf

@@ -1,0 +1,406 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cymbal-storefront-app-script
+  namespace: cymbal-storefront
+data:
+  server.py: |
+    import datetime
+    import html
+    import json
+    import os
+    import socket
+    import threading
+    import time
+    import urllib.request
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    SHARED_DIR = "/mnt/cymbal-filestore"
+    CATALOG_FILE = os.path.join(SHARED_DIR, "cymbal-catalog.json")
+    LOG_FILE = os.path.join(SHARED_DIR, "storefront-access.log")
+    REGISTRY_FILE = os.path.join(SHARED_DIR, "pod-registry.json")
+    RR_COUNTER_FILE = os.path.join(SHARED_DIR, "rr-counter.json")
+
+    REFRESH_INTERVAL_SEC = 3
+
+    MY_POD_NAME = os.environ.get("POD_NAME", socket.gethostname())
+    MY_NODE_NAME = os.environ.get("NODE_NAME", "unknown-node")
+    MY_POD_IP = os.environ.get("POD_IP", "127.0.0.1")
+
+    DEFAULT_CATALOG = [
+        {"sku": "CYM-101", "name": "Cymbal Cloud Mechanical Keyboard", "price": "$149.00", "category": "Peripherals", "stock": "In Stock (Shared NFS)"},
+        {"sku": "CYM-204", "name": "Cymbal UltraWide 34\" Curved Monitor", "price": "$599.00", "category": "Displays", "stock": "In Stock (Shared NFS)"},
+        {"sku": "CYM-309", "name": "Cymbal Noise-Cancelling Studio Headphones", "price": "$279.00", "category": "Audio", "stock": "In Stock (Shared NFS)"},
+        {"sku": "CYM-412", "name": "Cymbal Ergonomic Mesh Task Chair", "price": "$429.00", "category": "Office", "stock": "In Stock (Shared NFS)"},
+    ]
+
+    def ensure_shared_files():
+        os.makedirs(SHARED_DIR, exist_ok=True)
+        if not os.path.exists(CATALOG_FILE):
+            with open(CATALOG_FILE, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_CATALOG, f, indent=2)
+
+    def update_and_get_active_pods():
+        """Registers this pod in the shared Filestore registry and returns active pods interleaved by worker node."""
+        now_ts = time.time()
+        registry = {}
+        try:
+            if os.path.exists(REGISTRY_FILE):
+                with open(REGISTRY_FILE, "r", encoding="utf-8") as rf:
+                    registry = json.load(rf)
+        except Exception:
+            registry = {}
+
+        registry[MY_POD_NAME] = {
+            "pod_name": MY_POD_NAME,
+            "node_name": MY_NODE_NAME,
+            "pod_ip": MY_POD_IP,
+            "last_seen": now_ts,
+        }
+        active = {k: v for k, v in registry.items() if now_ts - v.get("last_seen", 0) < 30}
+        try:
+            tmp_file = f"{REGISTRY_FILE}.{MY_POD_NAME}.tmp"
+            with open(tmp_file, "w", encoding="utf-8") as wf:
+                json.dump(active, wf)
+            os.replace(tmp_file, REGISTRY_FILE)
+        except Exception:
+            pass
+
+        # Interleave pods by worker node so consecutive refreshes switch both worker node and pod
+        by_node = {}
+        for p in sorted(active.values(), key=lambda x: (x["node_name"], x["pod_name"])):
+            by_node.setdefault(p["node_name"], []).append(p)
+
+        interleaved = []
+        max_len = max((len(v) for v in by_node.values()), default=0)
+        nodes_sorted = sorted(by_node.keys())
+        for idx in range(max_len):
+            for n in nodes_sorted:
+                if idx < len(by_node[n]):
+                    interleaved.append(by_node[n][idx])
+        return interleaved
+
+    def next_round_robin_index():
+        """Advances and returns the shared round-robin request counter so every refresh changes pod & worker."""
+        seq = 0
+        try:
+            if os.path.exists(RR_COUNTER_FILE):
+                with open(RR_COUNTER_FILE, "r", encoding="utf-8") as f:
+                    seq = int(json.load(f).get("seq", 0))
+        except Exception:
+            seq = 0
+        seq += 1
+        try:
+            tmp_file = f"{RR_COUNTER_FILE}.{MY_POD_NAME}.tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump({"seq": seq}, f)
+            os.replace(tmp_file, RR_COUNTER_FILE)
+        except Exception:
+            pass
+        return seq
+
+    def heartbeat_loop():
+        while True:
+            try:
+                ensure_shared_files()
+                update_and_get_active_pods()
+            except Exception:
+                pass
+            time.sleep(3)
+
+    class CymbalHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/healthz":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+
+            if self.path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
+                return
+
+            ensure_shared_files()
+            active_pods = update_and_get_active_pods()
+
+            # On every external page load/refresh, advance to the next pod in round-robin order
+            if active_pods and "internal=1" not in self.path:
+                seq = next_round_robin_index()
+                target_pod = active_pods[seq % len(active_pods)]
+                if target_pod["pod_name"] != MY_POD_NAME and target_pod.get("pod_ip"):
+                    try:
+                        req_url = f"http://{target_pod['pod_ip']}:8080/?internal=1&seq={seq}"
+                        with urllib.request.urlopen(req_url, timeout=1.5) as resp:
+                            data = resp.read()
+                            self.send_response(200)
+                            self.send_header("Content-Type", "text/html; charset=utf-8")
+                            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                            self.send_header("Connection", "close")
+                            self.send_header("Content-Length", str(len(data)))
+                            self.end_headers()
+                            self.wfile.write(data)
+                            return
+                    except Exception:
+                        pass
+
+            now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            if self.path == "/" or self.path.startswith("/?"):
+                with open(LOG_FILE, "a", encoding="utf-8") as lf:
+                    lf.write(f"{now_str} | Pod: {MY_POD_NAME} ({MY_POD_IP}) | Worker: {MY_NODE_NAME}\n")
+
+            try:
+                with open(CATALOG_FILE, "r", encoding="utf-8") as cf:
+                    catalog = json.load(cf)
+            except Exception:
+                catalog = DEFAULT_CATALOG
+
+            recent_logs = []
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE, "r", encoding="utf-8") as lf:
+                    raw_lines = [ln for ln in lf.readlines() if "Window #" not in ln]
+                    recent_logs = raw_lines[-12:][::-1]
+
+            rows_html = "".join(
+                f"<tr><td><code>{html.escape(item['sku'])}</code></td>"
+                f"<td><strong>{html.escape(item['name'])}</strong></td>"
+                f"<td>{html.escape(item['category'])}</td>"
+                f"<td>{html.escape(item['price'])}</td>"
+                f"<td><span class='badge'>{html.escape(item['stock'])}</span></td></tr>"
+                for item in catalog
+            )
+
+            replicas_html = ""
+            for idx, p in enumerate(active_pods):
+                is_current = (p["pod_name"] == MY_POD_NAME)
+                status_badge = (
+                    "<span class='badge serving-badge'>ACTIVE — SERVING THIS REQUEST</span>"
+                    if is_current
+                    else "<span class='badge active-badge'>ACTIVE — READY (RWX MOUNTED)</span>"
+                )
+                row_style = "background:#eff6ff;font-weight:600;" if is_current else ""
+                replicas_html += (
+                    f"<tr style='{row_style}'>"
+                    f"<td>#{idx + 1}</td>"
+                    f"<td><code>{html.escape(p['pod_name'])}</code></td>"
+                    f"<td><code>{html.escape(p['pod_ip'])}</code></td>"
+                    f"<td><code>{html.escape(p['node_name'])}</code></td>"
+                    f"<td>{status_badge}</td></tr>"
+                )
+
+            logs_html = "".join(f"<li><code>{html.escape(line.strip())}</code></li>" for line in recent_logs)
+
+            body = f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <meta http-equiv="refresh" content="{REFRESH_INTERVAL_SEC}">
+      <title>Cymbal Shops — Stateless Retail Storefront (Cloud Filestore RWX)</title>
+      <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }}
+        header {{ background: linear-gradient(135deg, #1a73e8, #0d47a1); color: white; padding: 20px 40px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }}
+        header h1 {{ margin: 0 0 6px 0; font-size: 22px; }}
+        header p {{ margin: 0; opacity: 0.9; font-size: 13px; }}
+        .timer-box {{ background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3); border-radius: 8px; padding: 10px 16px; font-size: 13px; text-align: right; }}
+        .timer-box strong {{ color: #fde047; }}
+        .container {{ max-width: 1120px; margin: 24px auto; padding: 0 24px; }}
+        .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; margin-bottom: 24px; }}
+        .card {{ background: white; border-radius: 8px; padding: 16px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-left: 4px solid #1a73e8; }}
+        .card.highlight {{ border-left-color: #16a34a; background: #f0fdf4; }}
+        .card .label {{ font-size: 11px; text-transform: uppercase; color: #64748b; font-weight: 700; letter-spacing: 0.04em; }}
+        .card .value {{ font-size: 15px; font-weight: 700; margin-top: 6px; word-break: break-all; color: #0f172a; }}
+        .panel {{ background: white; border-radius: 8px; padding: 20px 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 24px; }}
+        .panel h2 {{ margin-top: 0; font-size: 17px; color: #1e293b; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 10px; }}
+        th, td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid #e2e8f0; font-size: 13px; }}
+        th {{ background: #f1f5f9; color: #475569; font-weight: 600; }}
+        .badge {{ background: #dcfce7; color: #166534; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }}
+        .serving-badge {{ background: #16a34a; color: white; }}
+        .active-badge {{ background: #dbeafe; color: #1e40af; }}
+        ul.logs {{ list-style: none; padding: 0; margin: 0; background: #0f172a; color: #38bdf8; border-radius: 6px; padding: 14px 18px; font-size: 12.5px; }}
+        ul.logs li {{ padding: 4px 0; border-bottom: 1px solid #1e293b; }}
+      </style>
+      <script>
+        let refreshSec = {REFRESH_INTERVAL_SEC};
+        setInterval(() => {{
+          if (refreshSec > 0) refreshSec--;
+          const rEl = document.getElementById('refresh-cnt');
+          if (rEl) rEl.textContent = refreshSec + 's';
+        }}, 1000);
+      </script>
+    </head>
+    <body>
+      <header>
+        <div>
+          <h1>Cymbal Shops — Cloud Retail Storefront (Option 1: Stateless + Cloud Filestore)</h1>
+          <p>Red Hat OpenShift Dedicated on Google Cloud | Regional Cloud Filestore (100Gi | 2000 IOPS | NFSv4.1 RWX) via GCP Filestore CSI Driver</p>
+        </div>
+        <div class="timer-box">
+          <div>Auto-Refresh &amp; Pod Rotation: <strong>Every {REFRESH_INTERVAL_SEC}s</strong> (next in <strong id="refresh-cnt">{REFRESH_INTERVAL_SEC}s</strong>)</div>
+          <div style="margin-top:4px;">All {len(active_pods)} Stateless Pods Active — Rotating Pod &amp; Worker on Every Refresh</div>
+        </div>
+      </header>
+      <div class="container">
+        <div class="cards">
+          <div class="card highlight">
+            <div class="label">Serving Stateless Pod (Changes Every Refresh)</div>
+            <div class="value">{html.escape(MY_POD_NAME)} ({html.escape(MY_POD_IP)})</div>
+          </div>
+          <div class="card highlight">
+            <div class="label">OpenShift Worker Node (Changes Every Refresh)</div>
+            <div class="value">{html.escape(MY_NODE_NAME)}</div>
+          </div>
+          <div class="card">
+            <div class="label">Shared Filestore Mount (RWX)</div>
+            <div class="value">{SHARED_DIR} (filestore-regional-csi)</div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Active Stateless Replicas Mounted to Shared Regional Filestore (All Pods Active)</h2>
+          <table>
+            <thead><tr><th>Replica</th><th>Pod Name</th><th>Pod IP</th><th>OpenShift Worker Node</th><th>Status</th></tr></thead>
+            <tbody>{replicas_html}</tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <h2>Shared Product Catalog (Loaded from Regional Cloud Filestore NFS)</h2>
+          <table>
+            <thead><tr><th>SKU</th><th>Product Name</th><th>Category</th><th>Price</th><th>Availability</th></tr></thead>
+            <tbody>{rows_html}</tbody>
+          </table>
+        </div>
+        <div class="panel">
+          <h2>Live Multi-Pod Shared Access Log (<code>{LOG_FILE}</code>)</h2>
+          <p style="font-size:13px;color:#475569;">Auto-refreshes every <strong>3 seconds</strong>; every refresh rotates to the next active Pod and Worker Node while all replicas read/write to the same Regional Cloud Filestore ReadWriteMany volume:</p>
+          <ul class="logs">{logs_html}</ul>
+        </div>
+      </div>
+    </body>
+    </html>"""
+            encoded = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Connection", "close")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    if __name__ == "__main__":
+        ensure_shared_files()
+        update_and_get_active_pods()
+        t = threading.Thread(target=heartbeat_loop, daemon=True)
+        t.start()
+        server = ThreadingHTTPServer(("0.0.0.0", 8080), CymbalHandler)
+        print("Cymbal Storefront listening on :8080...")
+        server.serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cymbal-storefront-web
+  namespace: cymbal-storefront
+  labels:
+    app: cymbal-storefront-web
+    app.kubernetes.io/part-of: cymbal-shops
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: cymbal-storefront-web
+  template:
+    metadata:
+      labels:
+        app: cymbal-storefront-web
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchLabels:
+                  app: cymbal-storefront-web
+              topologyKey: kubernetes.io/hostname
+      containers:
+      - name: storefront
+        image: registry.access.redhat.com/ubi9/python-314:latest
+        command: ["python3", "/app/server.py"]
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 256Mi
+        volumeMounts:
+        - name: cymbal-filestore-vol
+          mountPath: /mnt/cymbal-filestore
+        - name: app-script
+          mountPath: /app
+          readOnly: true
+      volumes:
+      - name: cymbal-filestore-vol
+        persistentVolumeClaim:
+          claimName: cymbal-shared-assets-pvc
+      - name: app-script
+        configMap:
+          name: cymbal-storefront-app-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cymbal-storefront-svc
+  namespace: cymbal-storefront
+  labels:
+    app: cymbal-storefront-web
+spec:
+  selector:
+    app: cymbal-storefront-web
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: cymbal-storefront
+  namespace: cymbal-storefront
+  labels:
+    app: cymbal-storefront-web
+  annotations:
+    haproxy.router.openshift.io/balance: roundrobin
+    haproxy.router.openshift.io/disable_cookies: "true"
+spec:
+  to:
+    kind: Service
+    name: cymbal-storefront-svc
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect

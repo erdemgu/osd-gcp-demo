@@ -1,0 +1,351 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: cymbal-ledger-db
+  namespace: cymbal-stateful
+  labels:
+    app: cymbal-ledger-db
+spec:
+  selector:
+    app: cymbal-ledger-db
+  ports:
+  - name: postgresql
+    port: 5432
+    targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cymbal-ledger-db
+  namespace: cymbal-stateful
+  labels:
+    app: cymbal-ledger-db
+    app.kubernetes.io/part-of: cymbal-shops
+spec:
+  serviceName: cymbal-ledger-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cymbal-ledger-db
+  template:
+    metadata:
+      labels:
+        app: cymbal-ledger-db
+    spec:
+      containers:
+      - name: postgresql
+        image: registry.redhat.io/rhel9/postgresql-16:latest
+        ports:
+        - containerPort: 5432
+          name: postgresql
+        env:
+        - name: POSTGRESQL_USER
+          value: "cymbal"
+        - name: POSTGRESQL_DATABASE
+          value: "cymbal_ledger"
+        - name: POSTGRESQL_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: cymbal-db-secret
+              key: POSTGRESQL_PASSWORD
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        volumeMounts:
+        - name: cymbal-hyperdisk-data
+          mountPath: /var/lib/pgsql/data
+        - name: secrets-store-inline
+          mountPath: /mnt/secrets-store
+          readOnly: true
+      volumes:
+      - name: secrets-store-inline
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "cymbal-gcp-secrets"
+  volumeClaimTemplates:
+  - metadata:
+      name: cymbal-hyperdisk-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: hyperdisk-balanced-csi
+      resources:
+        requests:
+          storage: 20Gi
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cymbal-ledger-ui-script
+  namespace: cymbal-stateful
+data:
+  ledger_app.py: |
+    import datetime
+    import html
+    import os
+    import random
+    import socket
+    import subprocess
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    DB_HOST = os.environ.get("DB_HOST", "cymbal-ledger-db")
+    DB_USER = os.environ.get("POSTGRESQL_USER", "cymbal")
+    DB_NAME = os.environ.get("POSTGRESQL_DATABASE", "cymbal_ledger")
+    SECRETS_DIR = "/mnt/secrets-store"
+
+    def run_sql(sql):
+        env = os.environ.copy()
+        pw_file = os.path.join(SECRETS_DIR, "db-password.txt")
+        if os.path.exists(pw_file):
+            with open(pw_file, "r", encoding="utf-8") as f:
+                env["PGPASSWORD"] = f.read().strip()
+        else:
+            env["PGPASSWORD"] = os.environ.get("POSTGRESQL_PASSWORD", "")
+        cmd = ["psql", "-h", DB_HOST, "-U", DB_USER, "-d", DB_NAME, "-t", "-A", "-F", "|", "-c", sql]
+        res = subprocess.run(cmd, env=env, capture_output=True, text=True, check=False)
+        return res.returncode, res.stdout.strip(), res.stderr.strip()
+
+    def init_db():
+        schema_sql = """
+        CREATE TABLE IF NOT EXISTS cymbal_orders (
+            order_id VARCHAR(32) PRIMARY KEY,
+            sku VARCHAR(32) NOT NULL,
+            item_name VARCHAR(128) NOT NULL,
+            amount VARCHAR(32) NOT NULL,
+            storage_tier VARCHAR(64) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO cymbal_orders (order_id, sku, item_name, amount, storage_tier)
+        VALUES
+          ('ORD-9001', 'CYM-101', 'Cymbal Cloud Mechanical Keyboard', '$149.00', 'Hyperdisk Balanced (RWO)'),
+          ('ORD-9002', 'CYM-204', 'Cymbal UltraWide 34" Curved Monitor', '$599.00', 'Hyperdisk Balanced (RWO)'),
+          ('ORD-9003', 'CYM-309', 'Cymbal Studio Headphones', '$279.00', 'Hyperdisk Balanced (RWO)')
+        ON CONFLICT (order_id) DO NOTHING;
+        """
+        run_sql(schema_sql)
+
+    class LedgerHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/add-order":
+                init_db()
+                oid = f"ORD-{random.randint(1000, 9999)}"
+                items = [
+                    ("CYM-101", "Cymbal Cloud Mechanical Keyboard", "$149.00"),
+                    ("CYM-204", "Cymbal UltraWide 34\" Curved Monitor", "$599.00"),
+                    ("CYM-412", "Cymbal Ergonomic Mesh Task Chair", "$429.00"),
+                    ("CYM-515", "Cymbal USB-C Thunderbolt Dock", "$219.00"),
+                ]
+                sku, name, price = random.choice(items)
+                run_sql(
+                    f"INSERT INTO cymbal_orders (order_id, sku, item_name, amount, storage_tier) "
+                    f"VALUES ('{oid}', '{sku}', '{name}', '{price}', 'Hyperdisk Balanced (RWO)') "
+                    f"ON CONFLICT DO NOTHING;"
+                )
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+
+            init_db()
+            rc, out, err = run_sql(
+                "SELECT order_id, sku, item_name, amount, storage_tier, to_char(created_at, 'YYYY-MM-DD HH24:MI:SS UTC') "
+                "FROM cymbal_orders ORDER BY created_at DESC LIMIT 15;"
+            )
+
+            secret_files = []
+            if os.path.exists(SECRETS_DIR):
+                secret_files = sorted(f for f in os.listdir(SECRETS_DIR) if not f.startswith("."))
+
+            api_key_masked = "Not Found"
+            api_key_path = os.path.join(SECRETS_DIR, "cymbal-api-key.txt")
+            if os.path.exists(api_key_path):
+                with open(api_key_path, "r", encoding="utf-8") as f:
+                    raw = f.read().strip()
+                    api_key_masked = raw[:8] + "••••••••" + raw[-4:] if len(raw) > 12 else "••••••••"
+
+            rows_html = ""
+            if rc == 0 and out:
+                for line in out.splitlines():
+                    parts = line.split("|")
+                    if len(parts) >= 6:
+                        rows_html += (
+                            f"<tr><td><code>{html.escape(parts[0])}</code></td>"
+                            f"<td><code>{html.escape(parts[1])}</code></td>"
+                            f"<td><strong>{html.escape(parts[2])}</strong></td>"
+                            f"<td>{html.escape(parts[3])}</td>"
+                            f"<td><span class='badge'>{html.escape(parts[4])}</span></td>"
+                            f"<td>{html.escape(parts[5])}</td></tr>"
+                        )
+            else:
+                rows_html = f"<tr><td colspan='6'>Database status: {html.escape(err or 'Waiting for PostgreSQL...')}</td></tr>"
+
+            body = f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="utf-8">
+      <title>Cymbal Order & Inventory Ledger (Stateful + Hyperdisk + Secret Manager)</title>
+      <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; background: #f8fafc; color: #0f172a; }}
+        header {{ background: linear-gradient(135deg, #0f766e, #115e59); color: white; padding: 24px 40px; display: flex; justify-content: space-between; align-items: center; }}
+        header h1 {{ margin: 0 0 6px 0; font-size: 24px; }}
+        header p {{ margin: 0; opacity: 0.9; font-size: 14px; }}
+        .btn {{ background: #f59e0b; color: #0f172a; border: none; padding: 10px 18px; border-radius: 6px; font-weight: 700; cursor: pointer; font-size: 14px; }}
+        .btn:hover {{ background: #fbbf24; }}
+        .container {{ max-width: 1080px; margin: 28px auto; padding: 0 24px; }}
+        .cards {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; margin-bottom: 24px; }}
+        .card {{ background: white; border-radius: 8px; padding: 16px 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border-left: 4px solid #0f766e; }}
+        .card .label {{ font-size: 12px; text-transform: uppercase; color: #64748b; font-weight: 600; }}
+        .card .value {{ font-size: 14px; font-weight: 700; margin-top: 6px; word-break: break-all; }}
+        .panel {{ background: white; border-radius: 8px; padding: 20px 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 24px; }}
+        .panel h2 {{ margin-top: 0; font-size: 18px; color: #1e293b; }}
+        table {{ width: 100%; border-collapse: collapse; margin-top: 12px; }}
+        th, td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid #e2e8f0; font-size: 14px; }}
+        th {{ background: #f1f5f9; color: #475569; font-weight: 600; }}
+        .badge {{ background: #ccfbf1; color: #115e59; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }}
+      </style>
+    </head>
+    <body>
+      <header>
+        <div>
+          <h1>Cymbal Order & Inventory Ledger (Option 2: Stateful + Hyperdisk + Secret Manager)</h1>
+          <p>PostgreSQL 16 StatefulSet on Google Cloud Hyperdisk Balanced | Secrets Store CSI Driver + GCP Secret Manager</p>
+        </div>
+        <form method="POST" action="/add-order" style="margin:0;">
+          <button class="btn" type="submit">+ Record New Order on Hyperdisk</button>
+        </form>
+      </header>
+      <div class="container">
+        <div class="cards">
+          <div class="card">
+            <div class="label">StatefulSet & Block Storage</div>
+            <div class="value">cymbal-ledger-db-0 (20Gi hyperdisk-balanced-csi)</div>
+          </div>
+          <div class="card">
+            <div class="label">Secrets Store CSI Mount</div>
+            <div class="value">/mnt/secrets-store ({html.escape(", ".join(secret_files) or "Mounted")})</div>
+          </div>
+          <div class="card">
+            <div class="label">GCP Secret Manager API Key</div>
+            <div class="value"><code>{html.escape(api_key_masked)}</code> (Verified via CSI)</div>
+          </div>
+        </div>
+        <div class="panel">
+          <h2>Persistent Cymbal Order Ledger (PostgreSQL 16 on Google Cloud Hyperdisk Balanced)</h2>
+          <table>
+            <thead><tr><th>Order ID</th><th>SKU</th><th>Product</th><th>Amount</th><th>Storage Backend</th><th>Recorded At</th></tr></thead>
+            <tbody>{rows_html}</tbody>
+          </table>
+        </div>
+      </div>
+    </body>
+    </html>"""
+            encoded = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+    if __name__ == "__main__":
+        server = HTTPServer(("0.0.0.0", 8080), LedgerHandler)
+        print("Cymbal Stateful Ledger UI listening on :8080...")
+        server.serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cymbal-ledger-ui
+  namespace: cymbal-stateful
+  labels:
+    app: cymbal-ledger-ui
+    app.kubernetes.io/part-of: cymbal-shops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cymbal-ledger-ui
+  template:
+    metadata:
+      labels:
+        app: cymbal-ledger-ui
+    spec:
+      containers:
+      - name: ledger-ui
+        image: registry.redhat.io/rhel9/postgresql-16:latest
+        command: ["python3", "/app/ledger_app.py"]
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: DB_HOST
+          value: "cymbal-ledger-db"
+        - name: POSTGRESQL_USER
+          value: "cymbal"
+        - name: POSTGRESQL_DATABASE
+          value: "cymbal_ledger"
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        volumeMounts:
+        - name: secrets-store-inline
+          mountPath: /mnt/secrets-store
+          readOnly: true
+        - name: ui-script
+          mountPath: /app
+          readOnly: true
+      volumes:
+      - name: secrets-store-inline
+        csi:
+          driver: secrets-store.csi.k8s.io
+          readOnly: true
+          volumeAttributes:
+            secretProviderClass: "cymbal-gcp-secrets"
+      - name: ui-script
+        configMap:
+          name: cymbal-ledger-ui-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cymbal-ledger-svc
+  namespace: cymbal-stateful
+  labels:
+    app: cymbal-ledger-ui
+spec:
+  selector:
+    app: cymbal-ledger-ui
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+---
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: cymbal-ledger
+  namespace: cymbal-stateful
+  labels:
+    app: cymbal-ledger-ui
+spec:
+  to:
+    kind: Service
+    name: cymbal-ledger-svc
+  port:
+    targetPort: http
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
